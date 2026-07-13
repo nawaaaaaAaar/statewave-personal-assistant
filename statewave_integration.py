@@ -11,7 +11,7 @@ matches your stack:
   Pattern 3 — LangChain RunnableLambda       (drop into any LCEL chain)
 
 Requirements:
-  pip install httpx openai
+  pip install statewave openai tiktoken
 
 Environment variables:
   STATEWAVE_BASE_URL   default: http://localhost:8100
@@ -27,7 +27,8 @@ import logging
 import os
 from typing import Any
 
-import httpx
+import statewave as sw
+import tiktoken
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,14 @@ STATEWAVE_API_KEY:  str = os.getenv("STATEWAVE_API_KEY", "")
 OPENAI_MODEL:       str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_MEMORY_TOKENS:  int = int(os.getenv("STATEWAVE_MAX_TOKENS", "800"))
 
+# Leave headroom for the model's reply so an oversized prompt+context never
+# silently overflows the context window.
+_MAX_REPLY_TOKENS = 512
+_CONTEXT_WINDOW = 128_000
+_PROMPT_TOKEN_LIMIT = _CONTEXT_WINDOW - _MAX_REPLY_TOKENS
+
 _openai: AsyncOpenAI | None = None
+_statewave: sw.AsyncStatewaveClient | None = None
 
 
 def _openai_client() -> AsyncOpenAI:
@@ -48,27 +56,40 @@ def _openai_client() -> AsyncOpenAI:
         _openai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
     return _openai
 
-# ── low-level Statewave helpers ───────────────────────────────────────────────
 
-def _sw_headers() -> dict[str, str]:
-    h = {"Content-Type": "application/json"}
-    if STATEWAVE_API_KEY:
-        h["X-Api-Key"] = STATEWAVE_API_KEY
-    return h
+def _statewave_client() -> sw.AsyncStatewaveClient:
+    global _statewave
+    if _statewave is None:
+        _statewave = sw.AsyncStatewaveClient(
+            STATEWAVE_BASE_URL,
+            api_key=STATEWAVE_API_KEY or None,
+        )
+    return _statewave
+
+
+def _count_tokens(model: str, messages: list[dict[str, str]]) -> int:
+    """Estimate token count for a list of chat messages using tiktoken."""
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except KeyError:
+        enc = tiktoken.get_encoding("cl100k_base")
+
+    total = 0
+    for msg in messages:
+        total += 4  # per-message overhead (role + separators)
+        total += len(enc.encode(msg.get("content", "")))
+    total += 2  # reply priming tokens
+    return total
+
+# ── low-level Statewave helpers ───────────────────────────────────────────────
 
 
 async def _get_context(user_id: str, message: str, max_tokens: int = MAX_MEMORY_TOKENS) -> str:
     """Return the assembled memory context string for *user_id*, or '' on failure."""
     try:
-        async with httpx.AsyncClient(base_url=STATEWAVE_BASE_URL, headers=_sw_headers(), timeout=10) as client:
-            res = await client.post("/v1/context", json={
-                "subject_id": user_id,
-                "task": message,
-                "max_tokens": max_tokens,
-            })
-            res.raise_for_status()
-            return res.json().get("assembled_context", "")
-    except Exception as exc:
+        bundle = await _statewave_client().get_context(user_id, message, max_tokens=max_tokens)
+        return bundle.assembled_context
+    except sw.StatewaveError as exc:
         logger.warning("Statewave get_context failed for %s: %s", user_id, exc)
         return ""
 
@@ -76,20 +97,18 @@ async def _get_context(user_id: str, message: str, max_tokens: int = MAX_MEMORY_
 async def _record_episode(user_id: str, user_message: str, assistant_response: str) -> None:
     """Record a conversation turn as a Statewave episode. Non-fatal."""
     try:
-        async with httpx.AsyncClient(base_url=STATEWAVE_BASE_URL, headers=_sw_headers(), timeout=10) as client:
-            await client.post("/v1/episodes", json={
-                "subject_id": user_id,
-                "source": "chat",
-                "type": "conversation",
-                "payload": {
-                    "messages": [
-                        {"role": "user",      "content": user_message},
-                        {"role": "assistant", "content": assistant_response},
-                    ]
-                },
-                "metadata": {},
-            })
-    except Exception as exc:
+        await _statewave_client().create_episode(
+            subject_id=user_id,
+            source="chat",
+            type="conversation",
+            payload={
+                "messages": [
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": assistant_response},
+                ]
+            },
+        )
+    except sw.StatewaveError as exc:
         logger.warning("Statewave record_episode failed for %s: %s", user_id, exc)
 
 
@@ -124,15 +143,23 @@ async def memory_chat(
     else:
         system = system_prompt
 
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": message},
+    ]
+
+    # 2b. Guard against blowing the context window — drop memory context if needed
+    # rather than letting the request fail outright.
+    if _count_tokens(model, messages) > _PROMPT_TOKEN_LIMIT:
+        logger.warning("Prompt too large for %s; stripping memory context", user_id)
+        messages[0] = {"role": "system", "content": system_prompt}
+
     # 3. Call the LLM.
     completion = await _openai_client().chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system",  "content": system},
-            {"role": "user",    "content": message},
-        ],
+        messages=messages,  # type: ignore[arg-type]
         temperature=0.3,
-        max_tokens=512,
+        max_tokens=_MAX_REPLY_TOKENS,
     )
     reply: str = completion.choices[0].message.content or ""
 

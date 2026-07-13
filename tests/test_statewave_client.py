@@ -1,121 +1,108 @@
-"""Unit tests for the Statewave API client."""
+"""Unit tests for the Statewave API client wrapper (mocks the statewave SDK)."""
+
+import uuid
+from datetime import UTC, datetime
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from pytest_httpx import HTTPXMock
+import statewave as sw
 
 from app.services.statewave import StatewaveClient, StatewaveError
 
 BASE = "http://localhost:8100"
 
-CONTEXT_PAYLOAD = {
-    "subject_id": "user_1",
-    "assembled_context": "User is a senior engineer.",
-    "token_estimate": 83,
-    "facts": [
-        {
-            "id": "mem_001",
-            "subject_id": "user_1",
-            "kind": "profile_fact",
-            "content": "Senior engineer, enterprise plan.",
-            "confidence": 0.98,
-            "source_episode_ids": ["ep_001"],
-            "created_at": "2024-06-01T10:00:00Z",
-            "tags": ["role"],
-        }
-    ],
-}
+MEM_ID = uuid.uuid4()
+EP_ID = uuid.uuid4()
+NOW = datetime(2024, 6, 1, 10, 0, 0, tzinfo=UTC)
 
-EPISODE_PAYLOAD = {
-    "id": "ep_xyz",
-    "subject_id": "user_1",
-    "source": "chat",
-    "type": "conversation",
-    "payload": {
-        "messages": [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"},
-        ]
-    },
-    "metadata": {},
-    "created_at": "2024-06-01T10:00:00Z",
-}
 
-COMPILE_PAYLOAD = {
-    "subject_id": "user_1",
-    "memories_created": 2,
-    "memories": [
-        {
-            "id": "mem_001",
-            "subject_id": "user_1",
-            "kind": "profile_fact",
-            "content": "Senior engineer.",
-            "confidence": 1.0,
-            "source_episode_ids": ["ep_001"],
-            "created_at": "2024-06-01T10:00:00Z",
-            "tags": [],
-        }
-    ],
-}
+def make_memory(**overrides: Any) -> sw.Memory:
+    defaults: dict[str, Any] = dict(
+        id=MEM_ID,
+        subject_id="user_1",
+        kind="profile_fact",
+        content="Senior engineer.",
+        confidence=1.0,
+        valid_from=NOW,
+        source_episode_ids=[EP_ID],
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    defaults.update(overrides)
+    return sw.Memory(**defaults)
 
-MEMORY_SEARCH_PAYLOAD = {
-    "memories": [
-        {
-            "id": "mem_001",
-            "subject_id": "user_1",
-            "kind": "profile_fact",
-            "content": "Senior engineer.",
-            "confidence": 1.0,
-            "source_episode_ids": ["ep_001"],
-            "created_at": "2024-06-01T10:00:00Z",
-            "tags": [],
-        }
-    ]
-}
+
+def make_episode(**overrides: Any) -> sw.Episode:
+    defaults: dict[str, Any] = dict(
+        id=EP_ID,
+        subject_id="user_1",
+        source="chat",
+        type="conversation",
+        payload={"messages": [{"role": "user", "content": "Hello"}]},
+        created_at=NOW,
+    )
+    defaults.update(overrides)
+    return sw.Episode(**defaults)
 
 
 @pytest.fixture()
-def sw() -> StatewaveClient:
-    return StatewaveClient(api_key="", base_url=BASE)
+def mock_sdk() -> AsyncMock:
+    return AsyncMock(spec=sw.AsyncStatewaveClient)
+
+
+@pytest.fixture()
+def sw_client(mock_sdk: AsyncMock) -> StatewaveClient:
+    with patch("app.services.statewave.sw.AsyncStatewaveClient", return_value=mock_sdk):
+        client = StatewaveClient(api_key="", base_url=BASE)
+    client._sdk = mock_sdk
+    return client
 
 
 @pytest.mark.asyncio
-async def test_get_context(httpx_mock: HTTPXMock, sw: StatewaveClient) -> None:
-    httpx_mock.add_response(
-        method="POST", url=f"{BASE}/v1/context", json=CONTEXT_PAYLOAD
+async def test_get_context(sw_client: StatewaveClient, mock_sdk: AsyncMock) -> None:
+    mock_sdk.get_context.return_value = sw.ContextBundle(
+        subject_id="user_1",
+        task="hi",
+        facts=[make_memory()],
+        assembled_context="User is a senior engineer.",
+        token_estimate=83,
+        receipt_id="rcpt_1",
     )
-    bundle = await sw.get_context("user_1", max_tokens=500)
+    bundle = await sw_client.get_context("user_1", max_tokens=500)
 
     assert bundle.subject_id == "user_1"
     assert bundle.token_estimate == 83
     assert len(bundle.facts) == 1
     assert bundle.facts[0].kind == "profile_fact"
     assert "senior engineer" in bundle.assembled_context.lower()
-    # alias
     assert bundle.memories == bundle.facts
 
 
 @pytest.mark.asyncio
-async def test_record_episode(httpx_mock: HTTPXMock, sw: StatewaveClient) -> None:
-    httpx_mock.add_response(
-        method="POST", url=f"{BASE}/v1/episodes", json=EPISODE_PAYLOAD
-    )
-    episode = await sw.record_episode(
+async def test_record_episode(sw_client: StatewaveClient, mock_sdk: AsyncMock) -> None:
+    mock_sdk.create_episode.return_value = make_episode()
+    episode = await sw_client.record_episode(
         subject_id="user_1",
         user_message="Hello",
         assistant_response="Hi!",
     )
 
-    assert episode.id == "ep_xyz"
+    assert episode.id == str(EP_ID)
     assert episode.subject_id == "user_1"
     assert episode.source == "chat"
 
 
 @pytest.mark.asyncio
-async def test_compile_memories(httpx_mock: HTTPXMock, sw: StatewaveClient) -> None:
-    httpx_mock.add_response(
-        method="POST", url=f"{BASE}/v1/memories/compile", json=COMPILE_PAYLOAD
+async def test_compile_memories(sw_client: StatewaveClient, mock_sdk: AsyncMock) -> None:
+    mock_sdk.compile_memories_wait.return_value = sw.CompileJob(
+        job_id="job_1",
+        status="completed",
+        subject_id="user_1",
+        memories_created=2,
+        memories=[make_memory()],
     )
-    result = await sw.compile_memories("user_1")
+    result = await sw_client.compile_memories("user_1")
 
     assert result.subject_id == "user_1"
     assert result.memories_created == 2
@@ -123,74 +110,63 @@ async def test_compile_memories(httpx_mock: HTTPXMock, sw: StatewaveClient) -> N
 
 
 @pytest.mark.asyncio
-async def test_list_memories(httpx_mock: HTTPXMock, sw: StatewaveClient) -> None:
-    httpx_mock.add_response(
-        method="GET",
-        url=f"{BASE}/v1/memories/search?subject_id=user_1",
-        json=MEMORY_SEARCH_PAYLOAD,
-    )
-    state = await sw.list_memories("user_1")
+async def test_list_memories(sw_client: StatewaveClient, mock_sdk: AsyncMock) -> None:
+    mock_sdk.search_memories.return_value = sw.SearchResult(memories=[make_memory()])
+    state = await sw_client.list_memories("user_1")
 
     assert state.total_memories == 1
     assert state.memories_by_type == {"profile_fact": 1}
-    assert state.entries[0].id == "mem_001"
+    assert state.entries[0].id == str(MEM_ID)
 
 
 @pytest.mark.asyncio
-async def test_statewave_error_on_4xx(httpx_mock: HTTPXMock, sw: StatewaveClient) -> None:
-    httpx_mock.add_response(
-        method="POST", url=f"{BASE}/v1/context", status_code=401, text="Unauthorized"
-    )
+async def test_statewave_error_on_4xx(sw_client: StatewaveClient, mock_sdk: AsyncMock) -> None:
+    mock_sdk.get_context.side_effect = sw.StatewaveAPIError(401, "unauthorized", "Unauthorized")
     with pytest.raises(StatewaveError) as exc_info:
-        await sw.get_context("user_1")
+        await sw_client.get_context("user_1")
 
     assert exc_info.value.status_code == 401
 
 
 @pytest.mark.asyncio
-async def test_statewave_error_on_5xx(httpx_mock: HTTPXMock, sw: StatewaveClient) -> None:
-    # 503 is retryable; register one response per attempt (initial + _MAX_RETRIES).
-    # The client must exhaust all retries before raising StatewaveError.
-    for _ in range(4):  # 1 initial + 3 retries
-        httpx_mock.add_response(
-            method="POST", url=f"{BASE}/v1/context", status_code=503, text="Service Unavailable"
-        )
+async def test_statewave_error_on_5xx(sw_client: StatewaveClient, mock_sdk: AsyncMock) -> None:
+    mock_sdk.get_context.side_effect = sw.StatewaveAPIError(
+        503, "service_unavailable", "Service Unavailable"
+    )
     with pytest.raises(StatewaveError) as exc_info:
-        await sw.get_context("user_1")
+        await sw_client.get_context("user_1")
 
     assert exc_info.value.status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_no_auth_header_when_no_key(httpx_mock: HTTPXMock) -> None:
-    """When no API key is set, X-Api-Key header must NOT be sent."""
-    httpx_mock.add_response(
-        method="POST", url=f"{BASE}/v1/context", json=CONTEXT_PAYLOAD
-    )
-    sw = StatewaveClient(api_key="", base_url=BASE)
-    await sw.get_context("user_1")
-    request = httpx_mock.get_requests()[0]
-    assert "x-api-key" not in {k.lower() for k in request.headers}
-    await sw.aclose()
+async def test_no_auth_header_when_no_key(mock_sdk: AsyncMock) -> None:
+    """When no API key is set, the SDK client must be constructed with api_key=None."""
+    with patch(
+        "app.services.statewave.sw.AsyncStatewaveClient", return_value=mock_sdk
+    ) as ctor:
+        StatewaveClient(api_key="", base_url=BASE)
+    assert ctor.call_args.kwargs["api_key"] is None
 
 
 @pytest.mark.asyncio
-async def test_auth_header_sent_when_key_set(httpx_mock: HTTPXMock) -> None:
-    httpx_mock.add_response(
-        method="POST", url=f"{BASE}/v1/context", json=CONTEXT_PAYLOAD
-    )
-    sw = StatewaveClient(api_key="sw-test-key", base_url=BASE)
-    await sw.get_context("user_1")
-    request = httpx_mock.get_requests()[0]
-    assert request.headers.get("x-api-key") == "sw-test-key"
-    await sw.aclose()
+async def test_auth_header_sent_when_key_set(mock_sdk: AsyncMock) -> None:
+    with patch(
+        "app.services.statewave.sw.AsyncStatewaveClient", return_value=mock_sdk
+    ) as ctor:
+        StatewaveClient(api_key="sw-test-key", base_url=BASE)
+    assert ctor.call_args.kwargs["api_key"] == "sw-test-key"
 
 
 @pytest.mark.asyncio
-async def test_context_manager(httpx_mock: HTTPXMock) -> None:
-    httpx_mock.add_response(
-        method="POST", url=f"{BASE}/v1/context", json=CONTEXT_PAYLOAD
+async def test_context_manager(sw_client: StatewaveClient, mock_sdk: AsyncMock) -> None:
+    mock_sdk.get_context.return_value = sw.ContextBundle(
+        subject_id="user_1",
+        task="",
+        assembled_context="User is a senior engineer.",
+        token_estimate=83,
     )
-    async with StatewaveClient(api_key="", base_url=BASE) as sw:
-        bundle = await sw.get_context("user_1")
+    async with sw_client as client:
+        bundle = await client.get_context("user_1")
     assert bundle.token_estimate == 83
+    mock_sdk.close.assert_awaited_once()

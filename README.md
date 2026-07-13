@@ -15,6 +15,35 @@ Clone it, run it, and see the difference in under five minutes.
 
 ---
 
+## 5-Minute Path
+
+Want to see real compiled memory before setting up an LLM key? This path skips the LLM entirely —
+it only needs Python and the OSS Statewave server.
+
+```bash
+# 1. Boot Statewave locally (API + admin console + Postgres) — one line, no clone needed
+npx @statewavedev/statewave
+
+# 2. In a new terminal, clone and install this repo
+git clone https://github.com/smaramwbc/statewave-personal-assistant.git
+cd statewave-personal-assistant
+python -m venv .venv && source .venv/bin/activate   # .venv\Scripts\activate on Windows
+pip install -e ".[dev]"
+
+# 3. Seed two demo users with realistic conversation history
+python -m scripts.seed
+
+# 4. Ask Statewave what it knows about one of them — no LLM call, no API key required
+curl http://localhost:8000/api/v1/memory/dev_alice
+```
+
+That last call returns the compiled, ranked memory facts Statewave extracted from `dev_alice`'s
+seeded sessions — the same context that would otherwise get injected into an LLM prompt. If you
+want to see it actually change an LLM's response, continue to the full [Quick Start](#quick-start)
+below and add an `LLM_API_KEY` to try `POST /api/v1/compare`.
+
+---
+
 ## The Problem This Solves
 
 Every session-based chat application faces the same wall. When a user returns after closing the tab, the assistant remembers nothing. The standard workaround is to inject the full conversation history into every prompt, but this breaks quickly:
@@ -113,7 +142,7 @@ git --version       # should print git version ...
 ### Step 1: Clone and install this repository
 
 ```bash
-git clone https://github.com/Infrasity-Labs/statewave-personal-assistant.git
+git clone https://github.com/smaramwbc/statewave-personal-assistant.git
 cd statewave-personal-assistant
 
 # Create an isolated Python environment (recommended)
@@ -144,7 +173,17 @@ Everything else has sensible defaults. A full list of available variables is in 
 
 ### Step 3: Start Statewave locally
 
-Statewave is a separate server that runs alongside your application. Clone and start it with Docker:
+Statewave is a separate server that runs alongside your application. It's fully open source ([Apache-2.0](https://github.com/smaramwbc/statewave)) — pick whichever way you want to run it:
+
+**Fastest — one line to a running server:**
+
+```bash
+npx @statewavedev/statewave
+```
+
+This boots the same open-source Statewave server (API, admin console, and Postgres) locally and wires it into your MCP clients. Equivalent one-liner: `curl -fsSL https://www.statewave.ai/install | sh`.
+
+**Prefer to run it yourself from source?** Clone and start it with Docker Compose:
 
 ```bash
 # In a new terminal window or tab, go up one level from this repo
@@ -465,6 +504,76 @@ Statewave runs on any PostgreSQL instance with the pgvector extension enabled. P
 
 ---
 
+## Integration Guide: Other Frameworks
+
+The entire memory layer is two calls: `_get_context` before the LLM/agent call, `_record_episode` after. This is already implemented, framework-agnostic, and copy-paste ready in [`statewave_integration.py`](statewave_integration.py) — the snippets below adapt its `memory_chat` pattern to two other stacks. In both cases, the Statewave calls themselves **do not change**; only how you call the model does.
+
+### Claude (Anthropic Messages API)
+
+The Anthropic Messages API takes `system` as a **top-level parameter**, not a `{"role": "system"}` entry in the `messages` list — that is the one real difference from the OpenAI-shaped code in `statewave_integration.py`.
+
+```python
+from anthropic import AsyncAnthropic
+from statewave_integration import _get_context, _record_episode
+
+_client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY from the environment
+
+async def memory_chat_claude(user_id: str, message: str) -> str:
+    # 1. Same as the OpenAI pattern — fetch ranked, token-bounded memory.
+    context = await _get_context(user_id, message)
+    system = "You are a helpful assistant."
+    if context.strip():
+        system += f"\n\n## What you know about this user\n{context}"
+
+    # 2. Framework-specific part: Claude wants `system` outside `messages`.
+    response = await _client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=512,
+        system=system,
+        messages=[{"role": "user", "content": message}],
+    )
+    reply = response.content[0].text
+
+    # 3. Same as the OpenAI pattern — record the turn.
+    await _record_episode(user_id, message, reply)
+    return reply
+```
+
+Identical to the OpenAI case: both `_get_context` and `_record_episode` calls. Framework-specific: `system` is a top-level `messages.create()` argument, and the reply is read from `response.content[0].text` instead of `completion.choices[0].message.content`.
+
+### CrewAI
+
+CrewAI has no single "system prompt" injection point the way a raw chat completion call does — a crew is built from `Agent`s with a `backstory` and `Task`s with a `description`, and you call `crew.kickoff()` once. The natural integration point is injecting `assembled_context` into the agent's backstory at construction time, and recording the episode from the final crew output.
+
+```python
+from crewai import Agent, Crew, Task
+from statewave_integration import _get_context, _record_episode
+
+async def memory_chat_crewai(user_id: str, message: str) -> str:
+    # 1. Same as the OpenAI pattern — fetch ranked, token-bounded memory.
+    context = await _get_context(user_id, message)
+    backstory = "You are a helpful assistant."
+    if context.strip():
+        backstory += f"\n\n## What you know about this user\n{context}"
+
+    # 2. Framework-specific part: memory goes into the agent's backstory,
+    #    not a chat message — CrewAI has no per-call system prompt.
+    assistant = Agent(role="Assistant", goal="Help the user", backstory=backstory)
+    task = Task(description=message, agent=assistant, expected_output="A helpful reply")
+    crew = Crew(agents=[assistant], tasks=[task])
+
+    result = crew.kickoff()
+    reply = str(result)
+
+    # 3. Same as the OpenAI pattern — record the turn.
+    await _record_episode(user_id, message, reply)
+    return reply
+```
+
+Identical to the OpenAI case: both `_get_context` and `_record_episode` calls. Framework-specific: memory is injected via `Agent(backstory=...)` at construction time rather than a per-request system message, and `crew.kickoff()` is synchronous — wrap it in `asyncio.to_thread` if you need it off the event loop in a real async app.
+
+---
+
 ## Running Tests
 
 No API keys or running servers are required to run the test suite. All HTTP calls to both the LLM and Statewave are mocked.
@@ -503,6 +612,27 @@ Copy `.env.example` to `.env` and configure the variables below. Only `LLM_API_K
 | `PORT`                 | No       | `8000`                      | Port the application server listens on.                                                                                              |
 | `LOG_LEVEL`            | No       | `info`                      | Logging verbosity. One of `debug`, `info`, `warning`, `error`, `critical`.                                                           |
 | `CORS_ORIGINS`         | No       | `http://localhost:8000,...` | Comma-separated list of allowed CORS origins. Set this for production deployments.                                                   |
+
+---
+
+## Operational Notes
+
+### Latency and cost on the hot path
+
+`get_context` is awaited directly in the request path (`app/api/routes.py`, in both `chat()` and `compare()`) — it blocks the LLM call from starting. Every memory-backed request pays one extra network round-trip compared to a no-memory baseline. The actual added latency depends entirely on your Statewave deployment (co-located with your app vs. cross-region, cold vs. warm connection pool), so don't take a number from anyone's README — measure it in your own environment. Every response already carries an `X-Request-ID` header (set by `request_id_middleware` in `app/main.py`), which you can correlate with your own timing/logging to see the real number for your setup.
+
+### Concurrent writes to the same subject
+
+Episodes are appended, not merged, so concurrent `record_episode` calls for the same `subject_id` are safe — there's no read-modify-write race on the episode log itself. Memory *compilation* (`compile_memories` / `compile_memories_wait`) is different: it processes a subject's episode backlog into compiled memories, and in this reference app it's only triggered explicitly (from `scripts/seed.py`), not on every request. If your app triggers compilation from request handlers, simultaneous compilation calls for the same subject need external coordination (a lock, or a single scheduled job) — this is exactly why the "Run memory compilation on a schedule" guidance above recommends a periodic job rather than compiling inline.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `curl: (7) Failed to connect` to `localhost:8100`, or app logs "Cannot connect to Statewave" | Statewave server isn't running | Start it — `npx @statewavedev/statewave` (see [5-Minute Path](#5-minute-path)) or `docker compose up -d` in the cloned `statewave` repo. |
+| `uvicorn` crashes on startup with `TypeError: Router.__init__() got an unexpected keyword argument 'on_startup'` (or a similar FastAPI/Starlette internals error) | Your shell's venv isn't activated, so `uvicorn`/`python` resolve to a global Python install with a mismatched FastAPI/Starlette pair instead of this project's pinned versions | Activate the venv first — `.venv\Scripts\Activate.ps1` (Windows PowerShell) or `source .venv/bin/activate` (macOS/Linux/Git Bash) — or invoke it explicitly: `.venv\Scripts\python.exe -m uvicorn app.main:app --reload`. |
+| `GET /api/v1/memory/{user_id}` returns `entries: []` even after chatting | Episodes were recorded but never compiled — memory compilation is a separate, explicit step from episode recording | Re-run `python -m scripts.seed`, or trigger `compile_memories` for that subject yourself. |
+| The assistant's response doesn't reflect something the user just said | Same root cause as above: `get_context` only returns already-*compiled* memories, not raw uncompiled episodes | Compile memories after enough new episodes accumulate (see "Episode" vs. "Memory" in [Core Concepts](#core-concepts)) rather than expecting every episode to be immediately queryable. |
 
 ---
 
